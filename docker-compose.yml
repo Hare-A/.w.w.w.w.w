@@ -1,0 +1,75 @@
+# Orden de arranque (lo garantizan los healthchecks, no solo depends_on):
+#   db (healthy) -> api (healthy) -> web
+# Sin "condition: service_healthy" Compose solo esperaría a que el contenedor
+# exista, y la API fallaría al conectarse a una base que aún no acepta conexiones.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app_password}
+      POSTGRES_DB: ${POSTGRES_DB:-walking_skeleton}
+    volumes:
+      # Volumen con nombre: los datos sobreviven a "docker compose down".
+      - db-data:/var/lib/postgresql/data
+      # Los .sql de esta carpeta corren SOLO si db-data está vacío (primer arranque
+      # o después de "down -v"). Si cambias el esquema, hay que recrear el volumen.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      # $$ evita que Compose interpole la variable; la expande el shell del contenedor.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: ./backend
+    environment:
+      # El host es "db" (nombre del servicio): dentro de la red de Compose cada
+      # servicio se resuelve por su nombre. "localhost" sería el propio contenedor de la API.
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-walking_skeleton}
+      DB_USER: ${POSTGRES_USER:-app}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-app_password}
+      PORT: 3000
+    volumes:
+      # Código montado desde tu máquina para el hot-reload.
+      - ./backend:/app
+      # Volumen anónimo: tapa ./backend/node_modules con el del contenedor, para que
+      # el montaje no pise las dependencias instaladas durante el build de la imagen.
+      - /app/node_modules
+    ports:
+      - "${API_PORT:-3000}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # 127.0.0.1 en vez de localhost: en Alpine "localhost" puede resolver a ::1 (IPv6)
+      # y el servidor escucha en IPv4.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  web:
+    build: ./frontend
+    environment:
+      # El proxy de Vite corre dentro del contenedor web, así que apunta al servicio api.
+      API_PROXY_TARGET: http://api:3000
+      WATCH_POLLING: ${WATCH_POLLING:-false}
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules # mismo truco del volumen anónimo que en api
+    ports:
+      - "${WEB_PORT:-5173}:5173"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  db-data:
